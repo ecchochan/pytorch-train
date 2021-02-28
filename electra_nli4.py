@@ -246,7 +246,7 @@ from transformers import ElectraConfig
 def get_model(args, tokenizer):
     config = ElectraConfig.from_pretrained('google/electra-base-discriminator')
     config.num_labels = 4
-    config.vocab_size = tokenizer.get_vocab_size()
+    config.vocab_size = tokenizer.get_vocab_size() if tokenizer else args.vocab_size
     model = ElectraForSequenceClassification(config)
     return model
 
