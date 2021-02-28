@@ -11,11 +11,13 @@
 
 
 
+
 import re
-def model_get_parameters(model, 
+def special_model_get_parameters(model, 
                          lr, 
                          lw_lr_decay=1, #0.908517, 
-                         weight_decay=None):
+                         weight_decay=None,
+                         log=False):
     named_parameters = list(model.named_parameters())
     lr_factors = []
     no_decay = [
@@ -25,13 +27,19 @@ def model_get_parameters(model,
     ]
     layers = set()
     for k, v in named_parameters:
-        r = re.search(r'.layers.(\d+)',k)
+        r = re.search(r'.layers?.(\d+)',k)
         if r:
             layer = int(r.group(1))
             layers.add(layer)
 
     num_layers = len(layers)
-
+    if log:
+        print("Applying Special Layer-wise Learning rate (%s)"%lw_lr_decay )
+        print("lr           :", lr)
+        print("weight_decay :", weight_decay)
+        print("num_layers   :", num_layers)
+        print()
+        
     for k, v in named_parameters:
         if not v.requires_grad:
           continue
@@ -40,17 +48,107 @@ def model_get_parameters(model,
         }
         factor = 1
         if lw_lr_decay and lw_lr_decay != 1:
-            r = re.search(r'.layers.(\d+)',k)
+            r = re.search(r'.layers?.(\d+)',k)
+            if r:
+                layer = int(r.group(1))  # 0 - 11
+                if layer < 6:
+                    factor = 0
+                elif layer < 9:
+                    factor = 0.25
+                else:
+                    layer = 1
+
+            elif 'embed_tokens.weight' in k or 'embed_positions' in k or 'embeddings' in k:
+                layer = 0
+                factor = 0
+ 
+
+        if factor < 2e-1:
+            v.requires_grad = False
+            continue
+            
+        param['lr'] = lr * factor
+
+        if log:
+            print('%.8f'%param['lr'], "(", '%.8f'%factor, ")", "<<", k)
+       
+        if weight_decay and weight_decay != 0:
+            wd = 0 if any(e in k for e in no_decay) else weight_decay
+            param['weight_decay'] = wd
+        
+        lr_factors.append(param)
+    return lr_factors
+      
+      
+
+
+
+
+
+import re
+def model_get_parameters(model, 
+                         lr, 
+                         lw_lr_decay=1, #0.908517, 
+                         weight_decay=None,
+                         special_layer_wise_lr=False,
+                         log=False):
+    if special_layer_wise_lr:
+        return special_model_get_parameters(
+             model, 
+             lr=lr, 
+             lw_lr_decay=lw_lr_decay,
+             weight_decay=weight_decay,
+             log=log
+        )
+    named_parameters = list(model.named_parameters())
+    lr_factors = []
+    no_decay = [
+        "bias",
+        "LayerNorm",
+        "layer_norm"
+    ]
+    layers = set()
+    for k, v in named_parameters:
+        r = re.search(r'.layers?.(\d+)',k)
+        if r:
+            layer = int(r.group(1))
+            layers.add(layer)
+
+    num_layers = len(layers)
+    if log:
+        print("Applying Layer-wise Learning rate (%s)"%lw_lr_decay )
+        print("lr           :", lr)
+        print("lw_lr_decay  :", lw_lr_decay)
+        print("weight_decay :", weight_decay)
+        print("num_layers   :", num_layers)
+        print()
+    for k, v in named_parameters:
+        if not v.requires_grad:
+          continue
+        param = {
+            'params': v,
+        }
+        factor = 1
+        if lw_lr_decay and lw_lr_decay != 1:
+            r = re.search(r'.layers?.(\d+)',k)
             if r:
                 layer = int(r.group(1))
                 factor = lw_lr_decay**(num_layers-layer)
 
-            elif 'embed_tokens.weight' in k or 'embed_positions' in k:
+            elif 'embed_tokens.weight' in k or 'embed_positions' in k or 'embeddings' in k:
                 layer = 0
-                factor = lw_lr_decay**(num_layers-layer)
+                factor = 0
  
+
+        if factor < 1e-2:
+            v.requires_grad = False
+            continue
+
         param['lr'] = lr * factor
 
+        if log:
+            print('%.8f'%param['lr'], "(", '%.8f'%factor, ")", "<<", k)
+       
         if weight_decay and weight_decay != 0:
             wd = 0 if any(e in k for e in no_decay) else weight_decay
             param['weight_decay'] = wd
@@ -75,6 +173,7 @@ def model_get_parameters(model,
 
 from tqdm import tqdm
 import os
+import errno
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -91,7 +190,20 @@ try:
     tpu_enabled = True
 except:
     tpu_enabled = False
-from transformers.optimization import get_linear_schedule_with_warmup
+    
+from torch.utils.tensorboard import SummaryWriter
+from torch.optim.lr_scheduler import LambdaLR
+def get_linear_schedule_with_warmup(optimizer, num_warmup_steps, num_training_steps, last_epoch=-1):
+
+    def lr_lambda(current_step: int):
+        if current_step < num_warmup_steps:
+            return float(current_step) / float(max(1, num_warmup_steps))
+        return max(
+            0.0, float(num_training_steps - current_step) / float(max(1, num_training_steps - num_warmup_steps))
+        )
+
+    return LambdaLR(optimizer, lr_lambda, last_epoch)
+
 from collections import OrderedDict
 
 from datetime import datetime
@@ -112,12 +224,12 @@ try:
 except:
     apex_enabled = False
 
-def format_log(log, formatter):
+def format_log(log, formatter, tb, step_i):
     args = []
     for k, v in log.items():
         try: log[k] = v.item() 
         except: pass
-    formatter(log)
+    formatter(log, tb, step_i)
     for k, v in log.items():
         try: v = v.item()
         except: pass
@@ -134,8 +246,8 @@ def format_log(log, formatter):
 
     return ' | '.join(k+':'+str(v) for k, v in args)
 
-def _train_update(log, formatter):
-    xm.master_print(format_log(log, formatter))
+def _train_update(log, formatter, tb, step_i):
+    xm.master_print(format_log(log, formatter, tb, step_i))
 
     
 
@@ -189,12 +301,16 @@ def do_share_parameters_again(model, shared_parameters, log=False):
 def train(rank, args):
     print('enter train @ %s'%(rank), flush=True)
     args.rank = rank
+    args.split = ''
     torch.manual_seed(42)
+    save_fn = os.path.join(args.save_dir, 'checkpoint_final.pt')
 
     tokenizer = get_tokenizer(args)
     args.vocab_size = tokenizer._tokenizer.get_vocab_size()
     
     train_dataset = get_dataset(args)
+    
+    batched_already = hasattr(train_dataset, '__getbatch__')
 
     if args.total_num_updates < 100:
         args.total_num_updates = len(train_dataset) * args.total_num_updates
@@ -216,7 +332,7 @@ def train(rank, args):
                 train_dataset,
                 num_replicas=args.gpus,
                 rank=rank,
-                shuffle=False)
+                shuffle=args.shuffle)
 
     else:
         rank = xm.get_ordinal()
@@ -225,52 +341,50 @@ def train(rank, args):
                 train_dataset,
                 num_replicas=xm.xrt_world_size(),
                 rank=rank,
-                shuffle=False)
+                shuffle=args.shuffle)
 
 
     train_loader = torch.utils.data.DataLoader(
         train_dataset,
-        batch_size=args.batch_size if not hasattr(train_dataset, '__getbatch__') else None,
+        batch_size=args.batch_size if not batched_already else None,
         sampler=train_sampler,
         pin_memory=True,
         shuffle=False,
         num_workers=args.num_workers)
         
 
-    eval_loader = None
+    eval_loaders = []
     if args.eval_dir:
-    
-        eval_sampler = None
-        if args.gpus:
-            dist.init_process_group(
-                'nccl', 
-                rank=rank, 
-                world_size=args.world_size
-            )
-            if args.gpus > 1:
-                traieval_samplern_sampler = torch.utils.data.distributed.DistributedSampler(
-                    train_dataset,
-                    num_replicas=args.gpus,
-                    rank=rank,
-                    shuffle=False)
+        for split in args.splits.split(','):
+            split = split.strip()
+            eval_sampler = None
+            if args.gpus:
+                if args.gpus > 1:
+                    eval_sampler = torch.utils.data.distributed.DistributedSampler(
+                        train_dataset,
+                        num_replicas=args.gpus,
+                        rank=rank,
+                        shuffle=False)
 
-        else:
-            rank = xm.get_ordinal()
-            if xm.xrt_world_size() > 1:
-                eval_sampler = torch.utils.data.distributed.DistributedSampler(
-                    train_dataset,
-                    num_replicas=xm.xrt_world_size(),
-                    rank=rank,
-                    shuffle=False)
-                
-        eval_dataset = get_eval_dataset(args)
-        eval_loader = torch.utils.data.DataLoader(
-            eval_dataset,
-            batch_size=args.batch_size if not hasattr(train_dataset, '__getbatch__') else None,
-            sampler=eval_sampler,
-            pin_memory=True,
-            shuffle=False,
-            num_workers=args.num_workers)
+            else:
+                rank = xm.get_ordinal()
+                if xm.xrt_world_size() > 1:
+                    eval_sampler = torch.utils.data.distributed.DistributedSampler(
+                        train_dataset,
+                        num_replicas=xm.xrt_world_size(),
+                        rank=rank,
+                        shuffle=False)
+
+            args.split = split
+            eval_dataset = get_eval_dataset(args)
+            eval_loader = torch.utils.data.DataLoader(
+                eval_dataset,
+                batch_size=args.batch_size if not batched_already else None,
+                sampler=eval_sampler,
+                pin_memory=True,
+                shuffle=False,
+                num_workers=args.num_workers)
+            eval_loaders.append(eval_loader)
 
     if args.gpus:
         assert apex_enabled
@@ -282,7 +396,7 @@ def train(rank, args):
         ##  Model Creation
         ##
         ##########################
-        model = get_model(args)
+        model = get_model(args, tokenizer)
 
         model.cuda(rank)
 
@@ -298,7 +412,9 @@ def train(rank, args):
             model_get_parameters(model,
                                  lr=args.lr,
                                  lw_lr_decay=args.lw_lr_decay,
-                                 weight_decay=args.weight_decay
+                                 weight_decay=args.weight_decay,
+                                 special_layer_wise_lr=args.special_layer_wise_lr,
+                                 log = rank == 0,
                                  ),  
 
                                  # use this function to set extra optimizer arguments, 
@@ -327,7 +443,7 @@ def train(rank, args):
         ##
         ##########################
         
-        model = get_model(args)
+        model = get_model(args, tokenizer)
 
 
         ##########################
@@ -373,6 +489,9 @@ def train(rank, args):
         xm.mark_step()
 
         # tracker = xm.RateTracker()
+        
+        
+        
     if args.restore_file:
         states = torch.load(args.restore_file, map_location=device)
         for k, v in list(states.items()):
@@ -383,13 +502,29 @@ def train(rank, args):
             if k.endswith('position_ids'):
                 del states[k]
                 states[k[:-12] + 'position_embeddings'] = v
+                
+        if args.gpus:
+            states = {"module.%s"%k : v for k, v in states.items()}
         try:
             model.load_state_dict(states)
         except Exception as err:
             import traceback
-            traceback.print_exc()
+            if rank == 0:
+                traceback.print_exc()
             model.load_state_dict(states, strict=False)
             
+        
+    if rank == 0:
+        if not os.path.exists(os.path.dirname(save_fn)):
+            try:
+                os.makedirs(os.path.dirname(save_fn))
+            except OSError as exc: # Guard against race condition
+                if exc.errno != errno.EEXIST:
+                    raise
+        if args.gpus:
+            torch.save(model.state_dict(), save_fn )
+        else:
+            xm.save(model.state_dict(), save_fn )
         
     model.train()
 
@@ -401,6 +536,14 @@ def train(rank, args):
     ##  Init LR Scheduler
     ##
     ##########################
+    
+    if not batched_already:
+        args.total_num_updates = args.total_num_updates // args.batch_size
+        args.warmup_updates = args.total_num_updates // args.batch_size
+        
+        
+    args.total_num_updates = args.total_num_updates // args.world_size
+    args.warmup_updates = args.total_num_updates // args.world_size
 
     scheduler = get_linear_schedule_with_warmup(
         optimizer, 
@@ -411,12 +554,17 @@ def train(rank, args):
     step_i = 0
 
     err = None
+    tb = None
+    #tb = SummaryWriter()
     try:
         if rank == 0:
             pbar = tqdm(total=args.total_num_updates)
         while step_i < args.total_num_updates:
             if not args.gpus:
                 batches = pl.ParallelLoader(train_loader, [device]).per_device_loader(device)
+                
+            n_samples = len(batches)
+                
             for sample in batches:
                 step_i += 1
                 if step_i > args.total_num_updates:
@@ -432,7 +580,7 @@ def train(rank, args):
                         sample, 
                         args=args, 
                         device=device, 
-                        gpu=args.gpus, 
+                        gpus=args.gpus, 
                         report=report_step
                     )
 
@@ -468,11 +616,21 @@ def train(rank, args):
                     if 'loss' not in log:
                         log['loss'] = total_loss
 
+                    # tb.add_scalar("Loss", total_loss, step_i)
+
+                    for k, v in log.items():
+                        try:
+                            dist.all_reduce(v, op=dist.reduce_op.SUM)
+                            log[k] = float(v)
+                        except Exception as e:
+                            print(v, e)
+                            pass
+                        
                     if args.gpus:
                         if rank == 0:
-                            pbar.set_description(format_log(log, log_formatter))
+                            pbar.set_description(format_log(log, log_formatter, tb, step_i))
                     else:
-                        xm.add_step_closure(_train_update, args=(log, log_formatter))
+                        xm.add_step_closure(_train_update, args=(log, log_formatter, tb, step_i))
 
                     if args.report_metrics:
                         xm.master_print(met.metrics_report())
@@ -481,48 +639,91 @@ def train(rank, args):
                 if rank == 0:
                     pbar.update(1)
 
-        if eval_loader is not None:
+        if rank == 0:
+            pbar.close()
+        if eval_loaders:
+            model.half()
             model.eval()
-            if not args.gpus:
-                batches = pl.ParallelLoader(eval_loader, [device]).per_device_loader(device)
-            with torch.no_grad():
-                record = OrderedDict()
+            model.cuda()
+            for k, v in model.named_parameters():
+                v.requires_grad =False
 
-                for sample in batches:
-                    evaluate(
-                        model, 
-                        sample, 
-                        args=args, 
-                        device=device, 
-                        record=record,
-                        gpu=args.gpus, 
-                        report=report_step
-                    )
+                
+            for split, eval_loader in zip(args.splits.split(','), eval_loaders):
+                batches = eval_loader
+                if rank == 0:
+                    eval_length = len(batches)
+                    if not batched_already:
+                        eval_length = eval_length // args.batch_size
 
+                    eval_length = eval_length // args.world_size
 
+                    pbar = tqdm(total=eval_length)
+                
+                if not args.gpus:
+                    batches = pl.ParallelLoader(eval_loader, [device]).per_device_loader(device)
+                with torch.no_grad():
+                    record = OrderedDict()
 
-                post_evaluate(record, args=args)
+                    for sample in batches:
+                        evaluate(
+                            model, 
+                            sample, 
+                            args=args, 
+                            device=device, 
+                            record=record,
+                            gpus=args.gpus, 
+                            report=False
+                        )
+                        if rank == 0:
+                            pbar.update(1)
 
-            import json
-            print('',flush=True)
-            print(json.dumps(record),flush=True)
-            print('',flush=True)
-        
+                    for k, v in record.items():
+                        try:
+                            def handle_reduce(v):
+                                if len(v.shape) == 0:
+                                    dist.all_reduce(v, op=dist.reduce_op.SUM)
+                                else:
+                                    L = [torch.ones_like(v) for _ in range(dist.get_world_size())]
+                                    dist.all_gather(L, v)
+                                    v = torch.car(L, dim=0)
+                                return v
+                            if isinstance(v, list):
+                                v = [handle_reduce(e) for e in v]
+                            else:
+                                v = handle_reduce(v)
+                            record[k] = float(v)
+                        except Exception as e:
+                            pass
+
+                    post_evaluate(record, args=args)
+
+                import json
+
+                if rank == 0:
+                    print('',flush=True)
+                    print('Test result for %s'%split, flush=True)
+                    print(json.dumps(record, indent=2),flush=True)
+                    print('',flush=True)
+
 
     except Exception as _err:
         err = _err
     finally:
-        save_fn = os.path.join(args.save_dir, 'checkpoint_final.pt')
         folder = os.path.split(os.path.abspath(save_fn))[0]
         os.makedirs(folder, exist_ok=True)
-        if rank == 0 and args.gpus:
-            torch.save(model.state_dict(), save_fn )
-            if err:
-                raise err
-        else:
-            xm.save(model.state_dict(), save_fn )
-            if err:
-                raise err
+        if rank == 0:
+            print("Saving to %s"%save_fn)
+            if args.gpus:
+                torch.save(model.state_dict(), save_fn )
+                if err:
+                    raise err
+            else:
+                xm.save(model.state_dict(), save_fn )
+                if err:
+                    raise err
+            print("Saved to %s"%save_fn)
+        #tb.close()
 
 import importlib
 
@@ -570,21 +771,26 @@ parser.add_argument('--restore-file', default='',
 parser.add_argument('--eval-dir', default='',
                     help='path to eval data')
 
+parser.add_argument('--splits', default='',
+                    help='splits for eval set')
+
 parser.add_argument('--vocab-file', default='',
                     help='vocab file of tokenizer')
-parser.add_argument( '--batch-size', type=int, 
+parser.add_argument( '--batch-size', type=int, default=1,
                     help='maximum number of sentences in a batch')
                     
-parser.add_argument( '--seq-length', type=int, 
+parser.add_argument( '--seq-length', type=int, default=128,
                     help='maximum number of tokens in a sentence')
 parser.add_argument('--warmup-updates', default=10000, type=args_float, 
                     help='warmup the learning rate linearly for the first N updates')
 
-parser.add_argument('--total-num-updates', default=1000000, type=int)
+parser.add_argument('--total-num-updates', default=1000000, type=args_float)
 parser.add_argument('--lr', default=0.0005, type=args_float)
 parser.add_argument('--weight-decay', default=0.01, type=args_float)
-parser.add_argument('--lw-lr-decay', default=1, type=args_float, 
+parser.add_argument('--lw-lr-decay', default=0.8, type=args_float, 
                     help='layer-wise learning rate decay')
+parser.add_argument('--shuffle', action='store_true', help='do shuffle or not')
+parser.add_argument('--special-layer-wise-lr', action='store_true', help='use TPU instead of CUDA')
 
 parser.add_argument('--tpu', action='store_true', help='use TPU instead of CUDA')
 parser.add_argument('--report-metrics', action='store_true', help='use TPU instead of CUDA')
