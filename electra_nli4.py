@@ -260,7 +260,7 @@ def get_loss(model, sample, args, device, gpus=0, report=False):
         labels = labels.to(device)
         type_ids = type_ids.to(device)
 
-    loss, pred = model(ids, mask, type_ids, labels=labels)
+    loss, pred = model(ids, mask, type_ids, labels=labels, return_dict=False)
 
     log = None
     if report:
