@@ -306,7 +306,7 @@ def train(rank, args):
     save_fn = os.path.join(args.save_dir, 'checkpoint_final.pt')
 
     tokenizer = get_tokenizer(args)
-    args.vocab_size = tokenizer._tokenizer.get_vocab_size()
+    args.vocab_size = tokenizer._tokenizer.get_vocab_size() if not args.vocab_size else args.vocab_size
     
     train_dataset = get_dataset(args)
     
@@ -776,6 +776,8 @@ parser.add_argument('--splits', default='',
 
 parser.add_argument('--vocab-file', default='',
                     help='vocab file of tokenizer')
+parser.add_argument( '--vocab-size', type=int, default=0,
+                    help='vocab size')
 parser.add_argument( '--batch-size', type=int, default=1,
                     help='maximum number of sentences in a batch')
                     
