@@ -173,6 +173,7 @@ def model_get_parameters(model,
 
 from tqdm import tqdm
 import os
+import sys
 import errno
 import torch
 import torch.nn as nn
@@ -558,7 +559,7 @@ def train(rank, args):
     #tb = SummaryWriter()
     try:
         if rank == 0:
-            pbar = tqdm(total=args.total_num_updates)
+            pbar = tqdm(total=args.total_num_updates, file=sys.stdout)
         while step_i < args.total_num_updates:
             if not args.gpus:
                 batches = pl.ParallelLoader(train_loader, [device]).per_device_loader(device)
@@ -658,7 +659,7 @@ def train(rank, args):
 
                     eval_length = eval_length // args.world_size
 
-                    pbar = tqdm(total=eval_length)
+                    pbar = tqdm(total=eval_length, file=sys.stdout)
                 
                 if not args.gpus:
                     batches = pl.ParallelLoader(eval_loader, [device]).per_device_loader(device)
